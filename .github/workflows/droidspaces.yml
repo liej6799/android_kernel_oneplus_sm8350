@@ -1,0 +1,120 @@
+name: Build DroidSpaces Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [android-16]
+    paths:
+      - 'arch/arm64/configs/vendor/lahaina-qgki_defconfig'
+      - 'arch/arm64/configs/vendor/lahaina_QGKI.config'
+      - 'include/linux/sched.h'
+      - 'include/linux/sched/user.h'
+      - '.github/workflows/droidspaces.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Maximize disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          sudo docker image prune -af || true
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip unzip python3
+
+      - name: Init KernelSU-Next (SUSFS)
+        run: bash init_ksu.sh susfs
+
+      - name: Cache toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/android/toolchain_oneplus_sm8350
+          key: toolchain-sm8350-clang-r547379
+
+      - name: Setup toolchain (AOSP clang r547379 + build-tools)
+        run: |
+          mkdir -p ~/android/toolchain_oneplus_sm8350
+          if [ ! -d ~/android/toolchain_oneplus_sm8350/clang-r547379 ]; then
+            git clone --depth 1 https://gitlab.com/kei-space/clang/r547379.git ~/android/toolchain_oneplus_sm8350/clang-r547379
+          fi
+          if [ ! -d ~/android/toolchain_oneplus_sm8350/build-tools ]; then
+            git clone --depth 1 --branch main-kernel-build-2024 https://android.googlesource.com/kernel/prebuilts/build-tools ~/android/toolchain_oneplus_sm8350/build-tools
+          fi
+          echo "$HOME/android/toolchain_oneplus_sm8350/build-tools/linux-x86/bin" >> "$GITHUB_PATH"
+          echo "$HOME/android/toolchain_oneplus_sm8350/clang-r547379/bin" >> "$GITHUB_PATH"
+          clang --version | head -1
+          ld.lld --version | head -1
+
+      - name: Build kernel
+        run: |
+          MAKEFLAGS=(
+            O=out
+            ARCH=arm64
+            LLVM=1
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            OBJSIZE=llvm-size
+            STRIP=llvm-strip
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          )
+          make "${MAKEFLAGS[@]}" vendor/lahaina-qgki_defconfig
+          make -j"$(nproc)" "${MAKEFLAGS[@]}"
+
+      - name: Show build banner
+        run: strings -a out/arch/arm64/boot/Image | grep -m1 "Linux version"
+
+      - name: Package AnyKernel zip
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          ZIPNAME="kernel-oneplus-sm8350-1.4.0-a16-droidspaces-${DATE}.zip"
+          # Reuse the known-good vendor_dlkm/vendor_ramdisk modules from the
+          # official 1.4.0 release (same source commit, KABI-stable layout)
+          curl -sL -o base.zip \
+            https://github.com/Gamesmes90/android_kernel_oneplus_sm8350/releases/download/1.4.0-a16-20260912/kernel-oneplus-sm8350-1.4.0-a16-20260912.zip
+          mkdir -p ak3
+          unzip -q base.zip -d ak3
+          cp out/arch/arm64/boot/Image ak3/Image
+          (cd ak3 && zip -qr9 "../${ZIPNAME}" .)
+          sha256sum "${ZIPNAME}" > sha256.txt
+          cat sha256.txt
+          echo "ZIPNAME=${ZIPNAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIPNAME }}
+          path: ${{ env.ZIPNAME }}
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: droidspaces-${{ github.run_number }}
+          name: ${{ env.ZIPNAME }}
+          body: |
+            DroidSpaces build (SYSVIPC/namespaces/IP_SET) with KABI-stable task_struct/user_struct.
+
+            - Source: ${{ github.sha }}
+            - Toolchain: AOSP clang r547379 (LTO + CFI + SCS)
+            - Packaging: official 1.4.0-a16-20260912 AK3 base with rebuilt Image
+          files: |
+            ${{ env.ZIPNAME }}
+            sha256.txt
